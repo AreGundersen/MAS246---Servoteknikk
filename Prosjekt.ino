@@ -7,21 +7,11 @@
 const int enablePin = 7;  // Pin for motor enable
 const int pwmPin = 6;     // PWM pin for motor speed control Down = [0-127], Up = [128-255];
 
-
-
 const int analogPin = A0; // Analog input for speed control
 const int encA  = 20;
 const int encB  = 21;
 
 volatile int encCount = 0; // 1 round = 4211;
-
-
-
-
-
-
-
-
 
 
 // Variables to Track State
