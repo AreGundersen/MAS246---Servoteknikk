@@ -1,219 +1,269 @@
 #include <LiquidCrystal.h>
-// Elevator setup and motor control
-const int numFloors = 8;
-int buttonPins[numFloors] = {22, 23, 24, 25, 26, 27, 28, 29};
-int ledPins[numFloors] = {49, 48, 47, 46, 45, 44, 43, 42};
+
+// LCD and Joystick setup
+LiquidCrystal lcd(41, 40, 37, 36, 35, 34);
+const int joystickX = A1;
+const int joystickY = A2;
+const int confirmButton = 2;
+
+// Elevator control variables
+const int numFloors = 8;  // Floors 0 through 7
+int currentFloor = 0;     // Elevator starts at floor 0
+int selectedFloor = 0;    // The floor the user is on
+int targetFloor = -1;     // The final destination floor
+bool isSelectingFloor = true;
+bool isChoosingDirection = false;
+bool isMovingToUserFloor = false;
+bool isWaitingForDestination = false;
+bool isWaitingForCall = false;  // New flag to indicate idle state after reaching destination
+int direction = 0;              // 1 for Up, -1 for Down
+int buttonPins[numFloors] = { 22, 23, 24, 25, 26, 27, 28, 29 };
+int ledPins[numFloors] = { 49, 48, 47, 46, 45, 44, 43, 42 };
 
 // Motor and encoder configuration
-const int enablePin = 7;       // Motor enable pin
-const int pwmPin = 6;          // PWM pin for motor speed control
-const int encA = 20;           // Encoder channel A
-const int encB = 21;           // Encoder channel B
-volatile long encCount = 0;    // Encoder count (1 round = 4211)
-const long countsPerFloor = 4048 * 2; // Adjusted for 1 full rotation per floor
+const int enablePin = 7;
+const int pwmPin = 6;
+const int encA = 20;
+const int encB = 21;
+volatile long encCount = 0;
+const long countsPerFloor = 3900*2;
+volatile int lastEncoded = 0;
 
-int currentFloor = 1;
-volatile int lastEncoded = 0;  // Stores the previous state of the encoder
-int lastPressedFloor = 1; // Initialize to a default floor, e.g., 1
-
-// Configurable speed and deceleration settings
-int baseSpeed = 254;         // Base speed for normal movement
-int slowSpeedUp = 0;         // Minimum upward speed when decelerating to prevent sudden stop
-int slowSpeedDown = 0;       // Minimum downward speed when decelerating to prevent sudden stop
-float decelerationDistance = 1; // Controls how early deceleration starts (in floor counts)
-
-
-
-// Initialize the LCD with the correct pin assignments
-LiquidCrystal lcd(41, 40, 37, 36, 35, 34);
+// Speed settings
+int baseSpeed = 254;
+int slowSpeed = 0;
 
 void setup() {
-
-  pinMode(4, OUTPUT);  // Set pin 4 as output for display backlight control
-  digitalWrite(4, HIGH);  // Turn on the backlight
   lcd.begin(16, 2);
+  Serial.begin(9600);
+
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
 
   // Initialize button and LED pins
   for (int i = 0; i < numFloors; i++) {
     pinMode(buttonPins[i], INPUT_PULLUP);
     pinMode(ledPins[i], OUTPUT);
-    digitalWrite(ledPins[i], LOW);  // Start with LEDs off
+    digitalWrite(ledPins[i], LOW);
   }
-  updateFloorIndicators(currentFloor);
 
-  // Motor setup
+  // Initialize motor and encoder setup
   pinMode(enablePin, OUTPUT);
   digitalWrite(enablePin, LOW);
   pinMode(pwmPin, OUTPUT);
-
-  // Set motor PWM to 127 initially to keep it stationary
   analogWrite(pwmPin, 127);
 
-  // Initialize encoder count to zero
   encCount = 0;
-
   pinMode(encA, INPUT);
   pinMode(encB, INPUT);
   attachInterrupt(digitalPinToInterrupt(encA), updateEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encB), updateEncoder, CHANGE);
 
-  Serial.begin(9600);
+  pinMode(confirmButton, INPUT_PULLUP);
+
+  // Set initial state: Start with waiting for a call
+  isWaitingForCall = true;
+  isSelectingFloor = false;
+  isChoosingDirection = false;
+  isMovingToUserFloor = false;
+  isWaitingForDestination = false;
+
+  // Display the initial prompt
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Select your floor:");
+  updateFloorSelectionDisplay();
 }
 
 void loop() {
-  // Debugging output to check encoder counts
-  Serial.print("Encoder Count: ");
-  Serial.println(encCount);
+  static String lastDirectionPrompt = "";  // To store the last prompt message
 
-  // Check for button presses
-  for (int i = 0; i < numFloors; i++) {
-    if (digitalRead(buttonPins[i]) == HIGH) {  // Check against HIGH for button press
-      lastPressedFloor = i + 1;  // Update to the last pressed floor
-      Serial.print("Button pressed for floor ");
-      Serial.println(lastPressedFloor);
-      moveToFloor(lastPressedFloor);
-      break;
+  // Step 1: Waiting for a New Call
+  if (isWaitingForCall) {
+    // Display "Select your" on the first line and "floor: " on the second line
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Select your");
+    lcd.setCursor(0, 1);
+    lcd.print("floor: ");
+    lcd.print(selectedFloor); // Display the currently selected floor number
+
+    // Joystick-based floor selection
+    int xValue = analogRead(joystickX);
+    if (xValue > 800 && selectedFloor < numFloors - 1) {
+      selectedFloor++;
+      delay(200);
+    } else if (xValue < 200 && selectedFloor > 0) {
+      selectedFloor--;
+      delay(200);
+    }
+
+    // Continuously update the selected floor display on the second line
+    lcd.setCursor(7, 1); // Move cursor to update only the floor number part
+    lcd.print(selectedFloor);
+
+    // Confirm selection
+    if (digitalRead(confirmButton) == HIGH) {
+      delay(200);
+      isWaitingForCall = false;          // Exit waiting state
+      isSelectingFloor = true;           // Begin direction selection process
+      lastDirectionPrompt = "";          // Reset the prompt tracker
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Choose Up or Down");
+    }
+
+    // Add a 10ms delay to slow down loop in Stage 1
+    delay(10);
+  }
+
+  // Step 2: Direction Selection
+  else if (isSelectingFloor) {
+    String currentPrompt;
+
+    // Determine available direction based on selected floor
+    if (selectedFloor == 0) {
+      currentPrompt = "Move: Up";  // Only Up option at floor 0
+    } else if (selectedFloor == 7) {
+      currentPrompt = "Move: Down";  // Only Down option at floor 7
+    } else {
+      currentPrompt = "Move: Up or Down";  // Both options available on floors 1 to 6
+    }
+
+    // Display the prompt only if it has changed
+    if (currentPrompt != lastDirectionPrompt) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(currentPrompt);
+      lastDirectionPrompt = currentPrompt;
+    }
+
+    // Handle joystick input for direction
+    int yValue = analogRead(joystickY);
+    if (yValue > 800 && selectedFloor < 7) {  // Up option, if not at top floor
+      direction = 1;
+      isSelectingFloor = false;  // Exit selection state
+      isChoosingDirection = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Calling elevator Up");
+    } else if (yValue < 200 && selectedFloor > 0) {  // Down option, if not at bottom floor
+      direction = -1;
+      isSelectingFloor = false;  // Exit selection state
+      isChoosingDirection = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Calling elevator Down");
+    }
+  }
+
+  // Step 3: Moving to User Floor
+  else if (isChoosingDirection) {
+    moveToFloor(selectedFloor);
+    isChoosingDirection = false;
+    isWaitingForDestination = true;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Select destination");
+  }
+
+  // Step 4: Waiting for Destination Selection
+  else if (isWaitingForDestination) {
+    listenForFloorButtonPress();
+    if (targetFloor != -1 && targetFloor != currentFloor) {
+      isWaitingForDestination = false;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Moving to Floor");
+      lcd.setCursor(0, 1);
+      lcd.print(targetFloor);
+      moveToFloor(targetFloor);
+
+      // Set the elevator to wait for a new call after reaching the target floor
+      isWaitingForCall = true;
+      selectedFloor = currentFloor;
+      targetFloor = -1;
+      direction = 0;
+      lastDirectionPrompt = "";
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Waiting for call");
     }
   }
 }
 
-void displayFloor(int floor) {
-  // Clear the display before writing new content
-  lcd.clear();
-  
-  // Set the cursor to the start of the first line
-  lcd.setCursor(0, 0);
-  lcd.print("Current Floor:");
 
-  // Set the cursor to the start of the second line
-  lcd.setCursor(0, 1);
-  lcd.print(floor); // Display the floor number
+// Auxiliary Functions for Display and Movement
+void updateFloorSelectionDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Select floor:");
+  lcd.print(selectedFloor);
+  delay(10);
 }
 
 void moveToFloor(int requestedFloor) {
   if (requestedFloor != currentFloor) {
-    Serial.print("Moving to floor ");
-    Serial.println(requestedFloor);
-
-    // Enable the motor
     digitalWrite(enablePin, HIGH);
-
     int direction = (requestedFloor > currentFloor) ? 1 : -1;
-    int totalFloorsToMove = abs(requestedFloor - currentFloor);
-    long targetCount = countsPerFloor * totalFloorsToMove;  // Total encoder count for the whole movement
-    int lastPassedFloor = currentFloor;
+    long targetCount = countsPerFloor * abs(requestedFloor - currentFloor);
+    setMotorSpeed(direction, baseSpeed);
 
-    // Set base speed based on distance to move
-    baseSpeed = (totalFloorsToMove > 1) ? 80 : 100;  // Adjust baseSpeed here if needed
-    setMotorSpeed(direction, baseSpeed);  // Start movement at base speed
-
-    int currentSpeed = baseSpeed;  // Track current speed to adjust gradually
-
+    encCount = 0;  // Reset encoder count before movement starts
     while (abs(encCount) < targetCount) {
-      // Debugging output for monitoring `encCount` and `targetCount`
-      Serial.print("Current Encoder Count: ");
-      Serial.print(encCount);
-      Serial.print(" | Target Count: ");
-      Serial.println(targetCount);
-
       int floorsPassed = abs(encCount) / countsPerFloor;
       int currentPassedFloor = currentFloor + (floorsPassed * direction);
 
-      if (currentPassedFloor != lastPassedFloor) {
-        lastPassedFloor = currentPassedFloor;
+      if (currentPassedFloor != currentFloor) {
         updateFloorIndicators(currentPassedFloor);
-        Serial.print("Passing floor ");
-        Serial.println(currentPassedFloor);
       }
 
-      // Calculate remaining counts and determine target speed
-      long remainingCounts = targetCount - abs(encCount);
-      int targetSpeed;
-      if (remainingCounts < (decelerationDistance * countsPerFloor)) {
-        if (direction > 0) {
-          // Upward deceleration
-          targetSpeed = map(remainingCounts, (decelerationDistance * countsPerFloor), 0, baseSpeed, slowSpeedUp);
-          targetSpeed = constrain(targetSpeed, slowSpeedUp, baseSpeed);
-        } else {
-          // Downward deceleration
-          targetSpeed = map(remainingCounts, (decelerationDistance * countsPerFloor), 0, baseSpeed, slowSpeedDown);
-          targetSpeed = constrain(targetSpeed, slowSpeedDown, baseSpeed);
-        }
-
-        // Incrementally adjust currentSpeed towards targetSpeed
-        if (currentSpeed < targetSpeed) {
-          currentSpeed++;  // Gradually increase speed
-        } else if (currentSpeed > targetSpeed) {
-          currentSpeed--;  // Gradually decrease speed
-        }
-        
-        setMotorSpeed(direction, currentSpeed);  // Apply the incrementally adjusted speed
-      }
-
-      delay(2); // Adjust delay for smoother updates if needed
+      delay(1);
     }
 
     stopMotor();
-    encCount = 0;
-    currentFloor = requestedFloor;
+    currentFloor = requestedFloor;  // Update current floor after reaching the destination
     updateFloorIndicators(currentFloor);
-
-    // Update the floor display
-    lcd.clear();  // Clear previous content
-    lcd.setCursor(0, 0);  // Set cursor to the first row
-    lcd.print("Current Floor: ");
-    lcd.setCursor(0, 1);
-    lcd.print(currentFloor);  // Display the current floor number
-
-    Serial.print("Arrived at floor ");
-    Serial.println(currentFloor);
-  } else {
-    Serial.println("Already at requested floor.");
+    displayFloor(currentFloor);
   }
 }
 
-// Update floor indicators based on the current floor during movement
+void listenForFloorButtonPress() {
+  for (int i = 0; i < numFloors; i++) {
+    if (digitalRead(buttonPins[i]) == HIGH) {
+      targetFloor = i;
+      digitalWrite(ledPins[i], HIGH);
+      Serial.print("Selected destination floor: ");
+      Serial.println(targetFloor);
+      return;
+    }
+  }
+}
+
 void updateFloorIndicators(int floor) {
-  // Turn off all LEDs
   for (int i = 0; i < numFloors; i++) {
     digitalWrite(ledPins[i], LOW);
   }
-  
-  // Turn on LED for the last pressed button
-  digitalWrite(ledPins[lastPressedFloor - 1], HIGH);
-  
-  // Display the current floor on the LCD
-  displayFloor(floor);  
-  delay(10);
+  digitalWrite(ledPins[floor], HIGH);
+  displayFloor(floor);
 }
 
-// Function to set motor speed with deadband adjustment
+void displayFloor(int floor) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("At Floor:");
+  lcd.setCursor(0, 1);
+  lcd.print(floor);
+}
+
 void setMotorSpeed(int direction, int speed) {
-  // Ensure speed is within 0–255
   speed = constrain(speed, 0, 255);
-
-  int adjustedSpeed;
-
-  if (direction > 0) {
-    // Upward movement, mapping speed to 0–124 range for full control
-    adjustedSpeed = map(speed, 0, 255, 125, 0);
-    Serial.print("Moving up with PWM: ");
-  } else {
-    // Downward movement, mapping speed to 130–255 range for full control
-    adjustedSpeed = map(speed, 0, 255, 129, 255);
-    Serial.print("Moving down with PWM: ");
-  }
-
+  int adjustedSpeed = (direction > 0) ? map(speed, 0, 255, 125, 0) : map(speed, 0, 255, 129, 255);
   analogWrite(pwmPin, adjustedSpeed);
-  Serial.println(adjustedSpeed);  // Print the adjusted speed for debugging
 }
-
 
 void stopMotor() {
-  // Set PWM to 127 to hold motor in a neutral state
   analogWrite(pwmPin, 127);
-
-  // Disable the motor entirely to eliminate noise
   digitalWrite(enablePin, LOW);
 }
 
@@ -221,7 +271,7 @@ void updateEncoder() {
   int MSB = digitalRead(encA);  // Most Significant Bit
   int LSB = digitalRead(encB);  // Least Significant Bit
 
-  int encoded = (MSB << 1) | LSB;    // Combine the bits into a single value
+  int encoded = (MSB << 1) | LSB;          // Combine the bits into a single value
   int sum = (lastEncoded << 2) | encoded;  // Shift the previous state and add the new one
 
   // Determine direction based on state changes
